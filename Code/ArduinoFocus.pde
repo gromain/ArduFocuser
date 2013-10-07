@@ -1,804 +1,435 @@
-//-------------------------------------------------------------------------------------
-//- Project           : ArduinoFocus
-//- Revision          : 11.03.29
-//- Author(s)         : Stormywebber , Frostbyte
-//- Requirements      : Arduino UNO Board, AdaFruit AFmotor Board, Stepperengine
-//-                   : Arduino IDE, AFmotor library
-//-                   : Robofocus client on PC either through ASCOM or direct.
-//- Description       : Project target is a computer controlled telescope focussing
-//-                     system using the RoboFocus serial command protocol.
-//-
-//- Todo              : Check and choose good variable and function names
-//-                     Store configuration in EEprom
-//-                     use better serialLib´s with: transmit buffer. tweak buffer sizes
-//-------------------------------------------------------------------------------------
 
-#include <AFMotor.h>
-#include <stdlib.h>
+
+
+
+#include <SPI.h>
 #include <EEPROM.h>
-#include <MsTimer2.h>
+#include <eepromRW.h>
 
-AF_Stepper motor(200, 2);              // 200 steps/rotation on port 2
+//START OF FOCUS CONTROL INITIALISE
+#define MAX_COMMAND_LEN             (5)
+#define MAX_PARAMETER_LEN           (6)
+#define COMMAND_TABLE_SIZE          (11)
+#define TO_UPPER(x) (((x >= 'a') && (x <= 'z')) ? ((x) - ('a' - 'A')) : (x))
 
-//-------------------------------------------------------------------------------------
-//- Global Constants
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-#define MINIM_MOTORSPEED      10
-#define MAXIM_MOTORSPEED      70
-#define SERCOMBAUDRATE        9600
-#define TEMPSENSPIN           0
-#define MAXSENSORS            3
-#define AVGDEPTH              3
+// initialize the library with the numbers of the interface pins
+int dirPin = 2; // Easy Driver Direction Output Pin
+int stepperPin = 3; // EasyDriver Stepper Step Output Pin
+int sleepPin = 9;
+int ms1Pin = 8;
+int ms2Pin = 7;
+int enablePin = 6;
+int resetPin = 5;
+int pfdPin = 4;
+unsigned long powerMillis = 0; // used to remember when EasyDriver power was enabled
+int motorSteps =1600; //number if steps for the motor to turn 1 revolution
 
-#define ROTS                   A3
-#define ROTA                   A4
-#define ROTB                   A5
 
-//-------------------------------------------------------------------------------------
-//- Global Variables definitions and declarations                                     -
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-unsigned char MySerBuf[9];
-unsigned char txframe[9];
-unsigned int  MyTmr1, MyTmr2, MyTmr3;
-int           Temperature = 600;
+volatile long NoOfSteps = 1000; //required number of steps to make
+volatile long Position = 0; //used to keep track of the current motorposition
+volatile long MaxStep = 19250; //define maximum no. of steps, max travel
+volatile int Speed = 500;
+volatile int BoardType = 0; // Boardtypes, default is 0, EasyDriver, 1=L293 chip, 2=LadyAda AFmotor board                           
 
-struct Ramping {
-    boolean      enabled;              //  
-    unsigned int Maxspeed;             //  
-    unsigned int Minspeed;             //
-    unsigned int Curspeed;             //
-    unsigned int Loc2;                 //  
-    unsigned int Loc3;                 //
-    unsigned int SpeedInc;             // speed in- decrease per step
-    unsigned int ramp;                 // length of ramp in steps
-} rp ;
+boolean Direction = true;//True is one way false is other.Change to false if motor is moving in the wrong direction
+boolean IsMoving = false;
+boolean Absolute = true;
+volatile long MaxIncrement=16384;//not yet used
+//END OF FOCUS CONTROL INITIALISE
 
-struct CalibParam {                    // Calibration Parameters aX^2 + bX + c
-  float a;
-  float b;
-  float c;  
-} ;
+//Serial comms setup
+char incomingByte = 0; // serial in data byte
+byte serialValue = 0;
+boolean usingSerial = true; // set to false to have the buttons control everything
+char gCommandBuffer[MAX_COMMAND_LEN + 1];
+char gParamBuffer[MAX_PARAMETER_LEN + 1];
+long gParamValue;
+volatile boolean UPDATE = true;
 
-struct AnalogSensors {
-   int  SurfTemp;             // Surface Temp                    [-100.0 to 100.0 °C]
-   int  AmbTemp;              // Ambient Air Temp                [-100.0 to 100.0 °C]
-   int  AmbHum;               // Ambient Air rel.Humidity        [   0.0 to 100.0 % ]
-   int  BarPres;              // Ambient Air barometric pressure [ 500   to 1500  mbar]
-   int  DewTemp;              // Dewpoint temperature in Celcius  (calculated from above)
-   long avgarray[MAXSENSORS]; // values are stored as <<AVGDEPTH  example *8
-   CalibParam CalPar[MAXSENSORS] ;
-} an ;
+struct config_t //Memory Structure for Parking, Unparking the Focuser and other config settings 
+{
+    long parkposition;
+    boolean parked;
+    boolean stepperdirection;
+    long controlboardtype;
+} configuration;
 
-struct PowerRelayModule {
-    boolean      ch1;                  //  Left channel
-    boolean      ch2;                  //  True == powered, false == off
-    boolean      ch3;                  //  
-    boolean      ch4;                  //  right channel
-} pm ;
 
-struct StepperCoordinate {
-    boolean      trigger;              //  Trigger to start stepper statemachine
-    boolean      powered;              //  Signals if stepper coils are powered
-    boolean      active;               //  signals is stepper is moving
-    boolean      StopNow;              //  Req immidiate stop of stepper
-    boolean      SendFrame;            //  signal to send frame when motor finisched moving
-    byte         DutyCycle;
-    byte         StepDelay;
-    byte         StepSize;
-    byte         Backlash;             //  nr of steps to take out slack
-    char         LashDir;              //  final moving direction the stepper
-    unsigned int LimitLoc;             //  
-    unsigned int CurrentLoc;
-    unsigned int TargetLoc;
-} sc ;
+typedef struct {
+  char const    *name;
+  void          (*function)(void);
+} 
+command_t;
 
-//-------------------------------------------------------------------------------------
-//- Setup, configure all hardware and software
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-void setup() {
-  pinMode(ROTA, INPUT);
-  pinMode(ROTB, INPUT);
-  pinMode(ROTS, INPUT);
-  digitalWrite(ROTA, HIGH);                        // enable pullups
-  digitalWrite(ROTB, HIGH);
-  digitalWrite(ROTS, HIGH);
 
-  Serial.begin(SERCOMBAUDRATE);                    // set up Serial library at 9600 bps
-  Serial.println("ArduinoFocus");                  //§DEBUG
+//Serial Comms setup end
 
-  MsTimer2::set(10, TimerInterupt);                // 10ms period
-  MsTimer2::start();
+//***************************************************
+//*****Start of User defined Functions **************
+//***************************************************
 
-  sc.trigger    = false;
-  sc.powered    = false;
-  sc.active     = false;
-  sc.StopNow    = false;
-  sc.SendFrame  = false;
-  sc.DutyCycle  = 1000 ;                            // == 100.0% =d250 in robofocus
-  sc.StepDelay  = 10;
-  sc.StepSize   = 1;
-  sc.Backlash   = 4;
-  sc.LashDir    = 'I';
-  sc.LimitLoc   = 65000;
-  sc.CurrentLoc = 32000;
-  sc.TargetLoc  = 32000;
-
-  rp.enabled    = false;                                     //  
-  rp.Maxspeed   = MAXIM_MOTORSPEED;                          //  
-  rp.Minspeed   = MINIM_MOTORSPEED;                          //
-  rp.Curspeed   = rp.Minspeed;                               //
-  rp.SpeedInc   = 1 ;                                        //
-  rp.ramp = (rp.Maxspeed - rp.Minspeed) / rp.SpeedInc ;      //
-  
-  pm.ch1 = pm.ch2 = pm.ch3 = pm.ch4 = false;                 // PowerRelayModule
-
-  motor.setSpeed(MAXIM_MOTORSPEED);                          // rpm   
-  motor.step(20,  FORWARD, SINGLE);    delay(50);            //§DEBUG
-  motor.step(20, BACKWARD, SINGLE);                          //§DEBUG
-  motor.setSpeed(MINIM_MOTORSPEED);                          // rpm   
-  motor.release();
-}//setup
-
-void LoadParam_E2P()
-{ 
-    EEPROM.read(0);
-    //EEPROM.write(0,0); //~3.3ms
+//START OF FOCUS CONTROL FUNCTIONS
+void EasyDriverStep(boolean dir,long steps){
+  digitalWrite(sleepPin, HIGH); // enable power to the EasyDriver
+  powerMillis = millis(); // remember when power was switched on
+  delayMicroseconds(10); // wait a bit after switching on power
+  digitalWrite(dirPin,dir);
+  delay(100);
+  for(int i=0;i<steps;i++){
+    digitalWrite(stepperPin, HIGH);
+    delayMicroseconds(Speed);
+    digitalWrite(stepperPin, LOW);
+    delayMicroseconds(Speed);
+  }
 }
 
-//-------------------------------------------------------------------------------------
-//- TimerInterupt, called every 10msec
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-void TimerInterupt()
-{ if (MyTmr1) MyTmr1--;
-  if (MyTmr2) MyTmr2--;
-  if (MyTmr3) MyTmr3--;
-}//TimerInterupt
+void ParkFocuserFun (void) {//Park the focuser by setting the Park bit to 1 and the current Focuser Position in Configuration
 
-//-------------------------------------------------------------------------------------
-//- Main Loop, calls the different statemachines for communication and steppercontrol -
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-void loop() {
+ if (configuration.parked == false){
+ configuration.parkposition = Position;
+ configuration.stepperdirection = Direction;
+ configuration.parked = true;
+ configuration.controlboardtype = BoardType;
+ 
+ EEPROM_writeAnything(0, configuration);
+ }
+  UPDATE=true; //Update even if the focuser was already parked
+}
 
-//  EEprom_storage();
-    SerialCommunication_StateMachine();
-    StepperMotor_StateMachine();
-    Sensor_StateMachine();                                   // Read all sensor like Temp,Hum,AirPressure
-    Keypad_StateMachine();
-  
-}//loop
+void FocusINFun (void) {//Move the Stepper IN.
+  long Steps = 0;
 
-//-------------------------------------------------------------------------------------
-//- StepperMotor_StateMachine, 
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-void StepperMotor_StateMachine()
-{  
-    static unsigned char Stepperstate = 0 ;                  // Statemachine
-  
-    if ( sc.StopNow )
-    { Stepperstate = 6;                                      // Immidiate stop of stepper
-      sc.TargetLoc = sc.CurrentLoc;
-    }
-  
-    switch (Stepperstate) {
-    case 0: //-----------------------------------------= Idle state
-          if ( sc.trigger )
-          { sc.active = true;                                // flag motor as moving
-//          Serial.print(sc.CurrentLoc);                     //§DEBUG
-            Stepperstate++;
-          }                                                  //§TODO Check for limit,zero,65000
-          break;
-     case 1: //-----------------------------------------= Analyse stepper action to be done
-
-          if      ( sc.TargetLoc > sc.CurrentLoc )           // Outward movement
-          {  if      (sc.LashDir == 'I') Stepperstate = 4;
-             else if (sc.LashDir == 'O') Stepperstate = 3;   // No backlash needed
-             else                        Stepperstate = 3;   // No backlash used
-             CalcMotorRamping();
-          }
-          else if ( sc.TargetLoc < sc.CurrentLoc )           // Inward
-          {  if      (sc.LashDir == 'I') Stepperstate = 5;   // No backlash needed
-             else if (sc.LashDir == 'O') Stepperstate = 2;
-             else                        Stepperstate = 5;   // No backlash used
-             CalcMotorRamping();
-          }
-          else                           Stepperstate = 6;   // Do nothing
-          break;    
-    case 2: //-----------------------------------------= Move Inward + 'O'backlash 
-          if (sc.CurrentLoc <= (sc.TargetLoc-sc.Backlash) )
-          { Stepperstate = 3;
-          }
-          else
-          { motor.step(1, FORWARD, SINGLE); sc.CurrentLoc--;
-            Serial.write('I');                                // ascom driver does not care if its 'I' or 'O'
-            UpdateMotorSpeed(Stepperstate);
-          }                                                   // just wants to know if its moving
-          break;
-    case 3: //-----------------------------------------= Move Outwards
-          if (sc.CurrentLoc >= sc.TargetLoc )
-          { Stepperstate = 6;
-          }
-          else
-          { motor.step(1, BACKWARD, SINGLE); sc.CurrentLoc++;
-            Serial.write('O');
-            UpdateMotorSpeed(Stepperstate);
-          }
-          break;
-    case 4: //-----------------------------------------= Move Outwards + 'I'backlash
-          if (sc.CurrentLoc >= (sc.TargetLoc+sc.Backlash) )
-          { Stepperstate = 5;
-          }
-          else
-          { motor.step(1, BACKWARD, SINGLE); sc.CurrentLoc++;
-            Serial.write('O');
-            UpdateMotorSpeed(Stepperstate);
-          }
-          break;
-    case 5: //-----------------------------------------= Move Inwards
-          if (sc.CurrentLoc <= sc.TargetLoc )
-          { Stepperstate = 6;
-          }
-          else
-          { motor.step(1, FORWARD, SINGLE); sc.CurrentLoc--;
-            Serial.write('I');
-            UpdateMotorSpeed(Stepperstate);
-          }
-          break;
-    case 6: //-----------------------------------------=  
-          sc.active = false;                                 // set flag motor as NOT moving
-          sc.trigger = false;                                // Reset trigger flag
-          sc.SendFrame = true;                               // Tell serialStatemachine to send frame.
-          rp.enabled = false;                                // Disable ramping
-          motor.release();
-          Stepperstate = 0;
-//        Serial.print('_');Serial.print(sc.CurrentLoc);     //§DEBUG
-          break;
-    default: //----------------------------------------=
-          Stepperstate = 0;
-          break;
-    }//switch
-    
-}//StepperMotor_StateMachine
-
-//-------------------------------------------------------------------------------------
-//- UpdateMotorSpeed() ,  Update motor speed
-//- Note:                                                                             -
-//-------------------------------------------------------------------------------------
-void UpdateMotorSpeed(unsigned char state )
-{
-  if ( rp.enabled )
+  if (Absolute == false) {  //If not Absolute move the number of steps
+    if ((Position-NoOfSteps)>=0) {
+        EasyDriverStep(Direction,NoOfSteps);
+        Position=Position-NoOfSteps;
+      }
+  }
+  else if (NoOfSteps < MaxStep) //Absolute :- work out the number of steps to take based on current position
   {
-    if ( state == 2 || state == 5 )            // Inward movements
-    {
-           if (sc.CurrentLoc > rp.Loc2) { IncMotorSpeed(); }
-      else if (sc.CurrentLoc > rp.Loc3) { DecMotorSpeed(); }
-      else                              { rp.Curspeed = rp.Minspeed ; rp.enabled = false ;}
-    }
-    else if ( state == 3 || state == 4 )       // Outward movements
-    {
-           if (sc.CurrentLoc < rp.Loc2) { IncMotorSpeed(); }
-      else if (sc.CurrentLoc < rp.Loc3) { DecMotorSpeed(); }
-      else                              { rp.Curspeed = rp.Minspeed ; rp.enabled = false ;}
-    }
-    else                                { rp.Curspeed = rp.Minspeed ; rp.enabled = false ;}
-  }
-  motor.setSpeed(rp.Curspeed);
-  
-}//UpdateMotorSpeed
-
-void IncMotorSpeed(void)
-{
-  rp.Curspeed += rp.SpeedInc;
-  if (rp.Curspeed > rp.Maxspeed) rp.Curspeed = rp.Maxspeed ;
-}//IncMotorSpeed
-
-void DecMotorSpeed(void)
-{
-  rp.Curspeed -= rp.SpeedInc;
-  if (rp.Curspeed < rp.Minspeed) rp.Curspeed = rp.Minspeed;
-}//IncMotorSpeed
-
-//-------------------------------------------------------------------------------------
-//- boolean CalcMotorRamping() ,  Calculate Pos2 and Pos3 for ramping
-//- Note:                                                                             -
-//-------------------------------------------------------------------------------------
-boolean CalcMotorRamping(void)
-{
-  rp.ramp = (rp.Maxspeed - rp.Minspeed) / rp.SpeedInc ;  // how fast to speedup/dowm
-  rp.enabled = true;
-  rp.Curspeed = rp.Minspeed;
-  motor.setSpeed(rp.Minspeed);
-  
-  if ( sc.TargetLoc > sc.CurrentLoc )                       // Outward movement
-  {  rp.Loc3 = sc.TargetLoc - ( sc.Backlash<<1 );
-     if (( rp.Loc3 - sc.CurrentLoc) <=  rp.ramp )
-       rp.enabled = false;
-     else if (( rp.Loc3 - sc.CurrentLoc) <= ( rp.ramp<<1 ))
-       { rp.Loc2 = (rp.Loc3 - sc.CurrentLoc) >>1 ;          // halveway
-         rp.Loc2 += sc.CurrentLoc;
-       }
-     else
-       rp.Loc2 = (rp.Loc3 - rp.ramp);
-  }
-  else if ( sc.TargetLoc < sc.CurrentLoc )                  // Inward movement
-  {  rp.Loc3 = sc.TargetLoc + ( sc.Backlash<<1 );
-     if (( sc.CurrentLoc - rp.Loc3) <=  rp.ramp )
-       rp.enabled = false;
-     else if (( sc.CurrentLoc - rp.Loc3) <= ( rp.ramp<<1 ))
-     { rp.Loc2 = (sc.CurrentLoc - rp.Loc3) >>1 ;
-       rp.Loc2 += rp.Loc3 ;
-     }
-     else
-       rp.Loc2 = (rp.Loc3 + rp.ramp);
-  }
-
-  Serial.write('§');Serial.print(sc.CurrentLoc);
-  Serial.write('_');Serial.print(rp.ramp);                   //§Debug
-  Serial.write('_');Serial.print(rp.Loc2);                   //§Debug
-  Serial.write('_');Serial.print(rp.Loc3);                   //§Debug
-  Serial.write('§');
-  
-  return(rp.enabled);
-}//CalcMotorRamping()
-
-//-------------------------------------------------------------------------------------
-//- SerialCommunication_StateMachine, Receive, validate, 
-//- Note: Flowchart of statemachineflow available                                                                                  -
-//-------------------------------------------------------------------------------------
-void SerialCommunication_StateMachine()
-{
-  static unsigned char Serialstate = 0 ;                      // Statemachine
-
-  if (sc.SendFrame)                                           // req. send end of moving frame FG?xxx, FI?xx, FO?
-  { sc.SendFrame=false;                                       // reset flag
-    if ( (Serialstate <= 1) && (sc.active==false) )           // if 'no frame in' AND 'stepper not moving'
-    {  Str2Bytecat(txframe,"FD0");
-       MyUtoA(sc.CurrentLoc);                                 // 
-       AddChecksum(txframe);
-       Serial.write(txframe, 9);                              // Send delayed response frame
-    }
-  }//fi
-  
-  switch (Serialstate) {
-    case 0: //-----------------------------------------=  Wait for first character
-          if ( Serial.available() > 0 )
-          { if (Serial.peek() == 'F')
-            {  Serialstate++;
-               MyTmr1 = 1000;                                 // Start timeout timer for frame
-            }
-            else
-            {  Serial.read();                                 // flush one char.
-            }
-          }
-          break;
-    case 1: //-----------------------------------------=  Wait for full command frame (9 chars)
-          if ( Serial.available() >= 9 ) 
-          {
-              int checksum = 0;                               // Buffer Copy and Checksum validation
-              for (int i=0; i <= 8; i++)                      // Checksum is Sum of first 8 char in frame
-              {  MySerBuf[i] = Serial.read();                 // Read frame from serial buffer
-                 checksum += MySerBuf[i];                     
-              }
-              checksum -= MySerBuf[8];                        // correct for add of checksum itself
+    if (NoOfSteps<Position){
     
-              if ( (byte)checksum == MySerBuf[8] )
-              {  Serialstate++;                               // Checksum OK, go to Next State
-              }
-              else 
-              {  Serialstate--;                               // Checksum FALSE, go to pervious State
-                 Serial.println("Checkum wrong");             // §debug
-              }
-          }
-          else if ( MyTmr1==0 )                               // timeout for frame
-          {   Serialstate--;                                  // go to pervious State
-              Serial.println("Frame Timeout");                // §debug
-          }
-          break;
-    case 2: //-----------------------------------------=  Is the Stepper still executing a command ?
-          if (sc.active)
-          { sc.StopNow = true;                                // YES,
-          }                                                   // Request stop motor, and wait for it
-          else
-             Serialstate++;                                   // No
-          break;          
-    case 3: //-----------------------------------------=  process received frame
-          switch( ProcessFrame() ){
-            case 1 :
-            { Serial.write(txframe, 9);                       // Send response frame 
-              break;
-            }
-            case 2 :
-            { sc.SendFrame=false;                             // Send response frame 
-              break;
-            }                                                 // after motor move
-          }
-          Serialstate++;
-          break;
-    case 4: //-----------------------------------------=  dummy state
-          Serialstate = 0;
-          break;
-    default: //----------------------------------------=  
-          Serial.println("ErrState_SCSM");                   // §debug
-          Serialstate = 0;
-          break;
-    }//switch
-}//SerialCommunication_StateMachine
-
-//-------------------------------------------------------------------------------------
-//- ProcessFrame, 
-//- Note: called from SerialCommunication_StateMachine() in state 2                   -
-//- returns : 0- no reply , 1-reply directly, 2-reply after motor move 
-//-------------------------------------------------------------------------------------
-unsigned char ProcessFrame(void)
-{ unsigned char transmit = 0;
-  unsigned int endnumber = 0;
-  char tmp[10];
-  
-  switch(MySerBuf[1])                                        // FCNNNNNNX
-  {
-    case 'V': //-----------------------------------------= Firmware Version
-    { Str2Bytecat(txframe,"FV000111");                       // build response frame
-      AddChecksum(txframe);
-      transmit = 1;                                          // frame can be transmitted
-      break;
-    }
-    case 'G': //-----------------------------------------= Goto position
-    { ExtractNumber(&endnumber);
-      if (endnumber == 0)
-      { Str2Bytecat(txframe,"FD0");                          // build response frame
-        MyUtoA(sc.CurrentLoc);
-        AddChecksum(txframe);
-        transmit = 1;                                        // frame can be transmitted
-      }
-      else
-      { sc.TargetLoc = endnumber;
-        if ( sc.TargetLoc > sc.LimitLoc ) sc.TargetLoc = sc.LimitLoc;
-        sc.trigger = true;                                   // signal StepperMotor_StateMachine()
-        Str2Bytecat(txframe,"FD0");                          // build part of response frame
-        transmit = 2;                                        // frame transmitted later
-      }
-      break;
-    }
-    case 'I': //-----------------------------------------= Go inwards
-    { ExtractNumber(&endnumber);
-      if (sc.CurrentLoc > endnumber)                         // sc.target wil be > 0
-         sc.TargetLoc = sc.CurrentLoc - endnumber;
-      else sc.TargetLoc = 1;
-      sc.trigger = true;                                     // signal StepperMotor_StateMachine()
-      Str2Bytecat(txframe,"FI0");                            // build part of response frame
-      transmit = 2;                                          // frame transmitted later
-      break;
-    }
-    case 'O': //-----------------------------------------= Go outwards
-    { ExtractNumber(&endnumber);
-      sc.TargetLoc = sc.CurrentLoc + endnumber;
-      if ( sc.TargetLoc > sc.LimitLoc ) sc.TargetLoc = sc.LimitLoc;
-      sc.trigger = true;                                     // signal StepperMotor_StateMachine()
-      Str2Bytecat(txframe,"FO0");                            // build part of response frame
-      transmit = 2;                                          // frame transmitted later
-      break;
-    }
-    case 'S': //-----------------------------------------= Set position coordinate
-    { ExtractNumber(&endnumber);
-      if (endnumber != 0)
-      { sc.CurrentLoc = endnumber;
-        if (sc.CurrentLoc > 64000) sc.CurrentLoc = 64000;
-      }
-      Str2Bytecat(txframe,"FS0");                            // build response frame
-      MyUtoA(sc.CurrentLoc);
-      AddChecksum(txframe);
-      transmit = 1;                                          // frame can be transmitted
-      break;
-    }
-    case 'L': //-----------------------------------------= Limit travel to position
-    { ExtractNumber(&endnumber);
-      if (endnumber != 0)
-      { sc.LimitLoc = endnumber;
-        if (sc.LimitLoc > 65000) sc.LimitLoc = 65000;
-      } 
-      Str2Bytecat(txframe,"FL0");                            // build response frame
-      MyUtoA(sc.LimitLoc);
-      AddChecksum(txframe);
-      transmit = 1;                                          // frame can be transmitted
-      break;
-    }
-    case 'P': //-----------------------------------------= Set discrete outputs
-    { 
-      if (!( (MySerBuf[4]=='0')&&(MySerBuf[5]=='0')&&(MySerBuf[6]=='0')&&(MySerBuf[7]=='0') ))
-      { pm.ch1 = pm.ch2 = pm.ch3 = pm.ch4 = false;
-        if (MySerBuf[4] == '2') pm.ch1 = true;
-        if (MySerBuf[5] == '2') pm.ch2 = true;
-        if (MySerBuf[6] == '2') pm.ch3 = true;
-        if (MySerBuf[7] == '2') pm.ch4 = true;
-      }
-      Str2Bytecat(txframe,"FP001111");                       // build response frame
-      if (pm.ch1) txframe[4] = '2';
-      if (pm.ch2) txframe[5] = '2';
-      if (pm.ch3) txframe[6] = '2';
-      if (pm.ch4) txframe[7] = '2';
-      AddChecksum(txframe);
-      transmit = 1;                                          // frame can be transmitted
-      break;
-    }
-    case 'B': //-----------------------------------------= Set Backlash
-    { ExtractNumber(&endnumber);
-      if (endnumber != 0)
-      { sc.Backlash= (byte)(endnumber & 0x00FF);
-  
-             if ( MySerBuf[2] == '2' ) sc.LashDir = 'I';     // Inwards
-        else if ( MySerBuf[2] == '3' ) sc.LashDir = 'O';     // Outwards
-        else                           sc.LashDir = 'D';     // Disabled
-        if (sc.Backlash==0)
-        { sc.LashDir = 'D'; sc.Backlash++;                   // Disabled
-        }
-      }
-  
-      Str2Bytecat(txframe,"FB1");                            // FB1xxxxx build response frame
-      if (sc.LashDir == 'I') txframe[2] = '2';               // FB2xxxxx
-      if (sc.LashDir == 'O') txframe[2] = '3';               // FB3xxxxx
-      MyUtoA(sc.Backlash);
-      AddChecksum(txframe);
-      transmit = 1;                                          // frame can be transmitted
-      break;
-    }
-    case 'C': //-----------------------------------------= Set configuration
-    { if ((MySerBuf[7] == '0') && (MySerBuf[6] == '0') && (MySerBuf[5] == '0'))
-      {
-        if (MySerBuf[2] != '0') 
-        { sc.DutyCycle = MySerBuf[2];                        // [2] dutycycle  not [5]
-          if (sc.DutyCycle > 250) sc.DutyCycle = 250;
-        }
-        if (MySerBuf[3] != '0')
-        { sc.StepDelay = MySerBuf[3];                        // [3] stepdelay  not [6]
-          if (sc.StepDelay > 64) sc.StepDelay = 64;
-          if (sc.StepDelay == 0) sc.StepDelay =  1;
-        }
-        if (MySerBuf[4] != '0')
-        { sc.StepSize  = MySerBuf[4];                        // [4] stepsize   not [7]
-          if (sc.StepSize > 64) sc.StepSize = 64;
-          if (sc.StepSize == 0) sc.StepSize =  1;
-        }
-      }
-      Str2Bytecat(txframe,"FC123000");                       // build response frame
-      txframe[2] = sc.DutyCycle;
-      txframe[3] = sc.StepDelay;
-      txframe[4] = sc.StepSize;
-      AddChecksum(txframe);
-      transmit = 1;                                          // frame can be transmitted
-      break;
-    }
-    case 'T': //-----------------------------------------= Get Temperature
-    { Str2Bytecat(txframe,"FT0");                            // build response frame
-      MyUtoA(Temperature);
-      AddChecksum(txframe);
-      transmit = 1;                                          // frame can be transmitted
-      break;
-    }
-    case 'X': //-----------------------------------------= Extended commandset
-    { Str2Bytecat(txframe,"FXtended");                       // build response frame
-      AddChecksum(txframe);
-      transmit = 1;                                          // frame can be transmitted
-      break;
-    }
-    default:  //-----------------------------------------= unknown command
-    { transmit = 0;
-      Serial.println("unknown cmnd");                        // §debug
-      break;
-    }   
-  }//switch
-    
-  return( transmit );
-}//ProcessFrame
-
-//-------------------------------------------------------------------------------------
-//- AddChecksum, Add a checksum to the serial transmit buffer
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-unsigned char AddChecksum(unsigned char *str)
-{
-  unsigned char tempbyte = 0;
-  for (int i=0; i<=7 ; i++ )  tempbyte +=  str[i];
-  str[8] = tempbyte;
-  return(tempbyte);
-}//CalcChecksum
-
-//-------------------------------------------------------------------------------------
-//- Str2Bytecat Copy/Concatenate ascii char from a string to a bytebuffer.
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-void Str2Bytecat(unsigned char *out, char *in)
-{ unsigned char i = 0;
-  while ( in[i] )                                        // check for EndOfString token
-  { out[i] = (unsigned char)in[i];
-    i++;
-  }
-}//Str2Bytecat
-
-//-------------------------------------------------------------------------------------
-//- ExtractNumber() , get number from frame ascii->bin
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-boolean ExtractNumber(unsigned int *out)
-{
-  const unsigned int multiply[] = { 0,0,0,10000,1000,100,10,1,0 };
-  boolean error = false;                                                 // 012345678
-  for (int i=3; i<=7 ; i++ )                                             // FV?XXXXXZ
-    if ( isdigit(MySerBuf[i]) )
-    { *out += multiply[i] * (unsigned int)(MySerBuf[i] & 0x0F); 
+      Steps=(Position-NoOfSteps);
+      EasyDriverStep(Direction,Steps);
+      Position=NoOfSteps;
     }
     else
-    { error = true;
-      break; 
-    }  
-    return(error);
-}//ExtractNumber
+    {
+      Steps=(NoOfSteps-Position);
+      EasyDriverStep(!Direction,Steps);
+      Position=NoOfSteps;  
+    }
+  }
+  // set the update flag so that the new position is displayed
+  IsMoving=true;
+  UPDATE=true;
+}
 
-//-------------------------------------------------------------------------------------
-//- Sensor_StateMachine() , measurement of all (analog) sensors 
-//-                          like Temp, Humidity, Barometric pressure, etc            -
-//-------------------------------------------------------------------------------------
-void Sensor_StateMachine(void)
-{
-  static unsigned char Sensorstate = 9;                     // Bootstate
-  static unsigned char Senscnt = 255;
+void FocusOUTFun (void) {//Move the Stepper OUT.
+  long Steps = 0;
+
+  if (Absolute == false) {  //If not Absolute move the number of steps
+    if ((Position+NoOfSteps)<=MaxStep) {
+        EasyDriverStep(!Direction,NoOfSteps);
+        Position=Position+NoOfSteps;
+      }
+  }
+  else if (NoOfSteps < MaxStep) //Absolute :- work out the number of steps to take based on current position
+  {
+    if (NoOfSteps>Position){
     
-  switch (Sensorstate) {
-    case 0: //-----------------------------------------= Wait for quiet moment 
-          if (!sc.active)                                   // if Idle
-          { if (Senscnt++ >= MAXSENSORS) Senscnt=0;
-            Sensorstate++;
-          }
-          break;
-    case 1: //-----------------------------------------= Do analog measurement and Average value 
-          long tmp, Old;
-          tmp = analogRead(Senscnt);                          // read analog pin
-          Old = an.avgarray[Senscnt];                         // fast and accurate averaging  
-          Old = ( Old - ( Old>>3 - tmp )) ;                   // fixed to (7*old+new)/8
-          an.avgarray[Senscnt] = Old;                         // does not throw away bits in avg routine
-          Sensorstate++;
-          break;
-    case 2: //-----------------------------------------= Calibrate , scale and limit
-          float tmp1, tmp2;
-          tmp2  = (float)(an.avgarray[0]>>3);      
-          tmp1  = an.CalPar[Senscnt].a * pow(tmp2,2);         //   aX^2
-          tmp1 += an.CalPar[Senscnt].b * tmp2;                // + bX
-          tmp1 += an.CalPar[Senscnt].c ;                      // + c
-          Sensorstate=0;
-          switch (Senscnt){
-            case 0: an.SurfTemp = (int)(tmp1) ; break;
-            case 1: an.AmbTemp  = (int)(tmp1) ; break;
-            case 2: an.AmbHum   = (int)(tmp1) ; break;
-            case 3: an.BarPres  = (int)(tmp1) ; break;         //disabled
-          }//switch
-          break;
-    case 3: //-----------------------------------------= 
-          Sensorstate=0;
-          break;
-    case 9: //-----------------------------------------= Boot
-          for ( byte i=0; i <MAXSENSORS ;i++)
-          {  an.avgarray[i] = (analogRead(i))<<3 ;            // fill average buffers, contains real value*8
-          }                                                   // extract real value : 
-          Sensorstate=0;                                      //  (int)(an.avgarray[i]>>3) ;
-          break;
-    default:  //-----------------------------------------= unknown state
-          Sensorstate=0;
-          break;
-  }//switch
+      Steps=(NoOfSteps-Position);
+      EasyDriverStep(!Direction,Steps);
+      Position=NoOfSteps;
+    }
+    else
+    {
+      Steps=(Position-NoOfSteps);
+      EasyDriverStep(Direction,Steps);
+      Position=NoOfSteps;  
+    }
+  }
+  // set the update flag so that the new position is displayed
+  IsMoving=true;
+  UPDATE=true;
+}
+
+void FocusSTEPSFun (void) {//Set the number of Steps.
+  NoOfSteps = gParamValue;
+  // set the update flag so that the new position is displayed
+  UPDATE=true;
+}
+
+// function to set the RPM of the stepper motor
+// user sends :Speed:500:
+void FocusSpeedFun (void) {
+  Speed = gParamValue;
+  UPDATE=true;
+}
+
+// Set max limit for focus travel, for absolute positioning focusers
+void FocusSLimitFun (void) {
+  MaxStep = gParamValue;
+  UPDATE=true;
+}
+
+// set current focuser position, used for calibrating absolute positioning focusers
+void FocusSPositionFun (void) {
+  Position = gParamValue;
+  UPDATE=true;
+}
+
+// set the focuser mode to relative 0 or absolute positioning 1
+void FocusSModeFun (void) {
+  switch (gParamValue){
+  case 0:
+    Absolute=false;
+    //Serial.println("Relative Mode"); // debug only
+    break;
+  case 1:
+    Absolute=true;
+    //Serial.println("Absolute Mode"); // debug only
+    break;
+  default:
+    //Serial.println("0 or 1 for relative or absolute, try again"); // debug only
+    break;  
+  }
+  UPDATE=true;
+}
+// to add different motor types, stepper, servo or DC
+void FocusSTypeFun(void){
+  UPDATE=true;
+}
+
+// to add different motor types, stepper, servo or DC
+void FocusBoardTypeFun(void){
+  BoardType=gParamValue;
+  UPDATE=true;
+}
+//END OF FOCUS CONTROL FUNCTIONS
+
+//Start of serial control functions
+
+void SerialDATAFun (void) {//Update All information over comms if there has been any change in the state of the focuser
+  Serial.print("#POS:");  
+  Serial.print(Position);
+  Serial.println(";");
+  Serial.print("#STP:" );
+  Serial.print(NoOfSteps);
+  Serial.println(";");
+  Serial.print("#MDE:");
+  if (Absolute){
+    Serial.print("1");
+  }
+  else{  
+    Serial.print("0");
+  }
+  Serial.println(";");
+  Serial.print("#LMT:");
+  Serial.print(MaxStep);
+  Serial.println(";");
+  Serial.print("#SPD:");
+  if (Speed==0){
+    Serial.print(char(Speed));
+  }
+  else{  
+    Serial.print(Speed);
+  }
+  Serial.println(";");
+  if (IsMoving==true) {
+    Serial.print("#MOV:");
+    Serial.print("1");
+    Serial.println(";");
+    IsMoving=false;
+  }
+  Serial.print("#BRD:0");  
+  Serial.print(BoardType);
+  Serial.println(";");
+  Serial.print("#PRK:");  
+  if (configuration.parked == 1) Serial.print("01"); else Serial.print("00");
+  Serial.println(";");
+}
+
+
+//Set up a command table. when the command "IN" is sent from the PC and this table points it to the subroutine to run
+command_t const gCommandTable[COMMAND_TABLE_SIZE] = {
+  {
+    "IN1",     FocusINFun,  }
+  ,
+  {
+    "OUT",    FocusOUTFun,   }
+  ,
+  {
+    "STP",  FocusSTEPSFun,   }
+  ,
+  {
+    "SPD",  FocusSpeedFun,   }
+  ,
+  {
+    "LMT",  FocusSLimitFun,   }
+  ,
+  {
+    "POS",    FocusSPositionFun,   }
+  ,  
+  {
+    "MDE",   FocusSModeFun,   }
+  ,
+  {
+    "TYP",   FocusSTypeFun,   }
+  ,  
+  {
+    "PRK",   ParkFocuserFun,   }
+  ,  
+  {
+    "BRD",   FocusBoardTypeFun,   }
+  ,  
+  {
+    NULL,      NULL   }
+};
+
+
+//Process Command. This searches the command table to see if the command exits if it does then the required subroutine is run
+void cliProcessCommand(void)
+{
+  int bCommandFound = false;
+  int idx;
+
+  /* Convert the parameter to an integer value. 
+   * If the parameter is emplty, gParamValue becomes 0. */
+  gParamValue = strtol(gParamBuffer, NULL, 0);
+
+  /* Search for the command in the command table until it is found or
+   * the end of the table is reached. If the command is found, break
+   * out of the loop. */
+  for (idx = 0; gCommandTable[idx].name != NULL; idx++) {
+    if (strcmp(gCommandTable[idx].name, gCommandBuffer) == 0) {
+      bCommandFound = true;
+      break;
+    }
+  }
+
+  /* If the command was found, call the command function. Otherwise,
+   * output an error message. */
+  if (bCommandFound == true) {
+    (*gCommandTable[idx].function)();
+  }
+}
+
+
+// When data is in the Serial buffer this subroutine is run and the information put into a command buffer.
+// The character : is used to define the end of a Command string and the start of the parameter string
+// The character ; is used to define the end of the Parameter string
+int cliBuildCommand(char nextChar) {
+  static uint8_t idx = 0; //index for command buffer
+  static uint8_t idx2 = 0; //index for parameter buffer
+  int loopchk = 0;
+
+  nextChar = Serial.read();
+  do
+  {
+
+    gCommandBuffer[idx] = TO_UPPER(nextChar);
+    idx++;
+    nextChar = Serial.read();
+    loopchk=loopchk+1;
+  } 
+  while ((nextChar != ':') && (loopchk < 100));
+
+  loopchk=0;
+
+  nextChar = Serial.read();
+
+  do
+  {
+
+    gParamBuffer[idx2] = nextChar;
+    idx2++;
+    nextChar = Serial.read();
+  } 
+  while ((nextChar != ';')&& (idx2 < 100));
+
+
+
+  gCommandBuffer[idx] = '\0';
+  gParamBuffer[idx2] = '\0';
+  idx = 0;
+  idx2 = 0;
+
+  return true;
+}
+
+//END of serial control functions
+
+
+
+void setup() {
+
+  EEPROM_readAnything(0, configuration); //PARKING:- Read the Position and Parked info
+  if (configuration.parked == true) { //If the Focuser was Parked then load the Position information
+    Position = configuration.parkposition; //Load the Position information
+    Direction = configuration.stepperdirection;
+    BoardType = configuration.controlboardtype;
+  }
+
+  pinMode(dirPin, OUTPUT); //Initialise Easydriver output
+  pinMode(stepperPin, OUTPUT); //Initialise Easydriver output
+  pinMode(ms1Pin, OUTPUT); //Initialise Easydriver output
+  pinMode(ms2Pin, OUTPUT); //Initialise Easydriver output
+  pinMode(resetPin, OUTPUT); //Initialise Easydriver output
+  pinMode(enablePin, OUTPUT); //Initialise Easydriver output
+  pinMode(sleepPin, OUTPUT); //Initialise Easydriver output
+  pinMode(pfdPin, OUTPUT); //Initialise Easydriver output
   
-}//Sensor_StateMachine
-
-//-------------------------------------------------------------------------------------
-//- Keypad_StateMachine
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-void Keypad_StateMachine(void)
-{
-  static boolean keymode = false;
-  static unsigned char keystate = 0;
+  Serial.begin(19200);// start the serial
   
-  switch ( keystate ) {
-    case 0: //-----------------------------------------=  Wait for keypress
-          if ( digitalRead(ROTS) == LOW )
-          { MyTmr3 = 10; // start 100 ms timer 
-            keystate++;
-          }
-          else                                                   // poll rotary switch
-          { 
-            if ( digitalRead(ROTA) == LOW )
-            {
-              if ( digitalRead(ROTB) == HIGH ) 
-              {   //if (sc.active) break;
-                  sc.TargetLoc = sc.CurrentLoc + 1;                 // slow mode 1 step
-                  if (keymode) sc.TargetLoc += 7;                   // fast mode -> 8steps
-                  sc.trigger = true;
-                  keystate=3;
-              }
-              else
-              {   //if (sc.active) break;
-                  sc.TargetLoc = sc.CurrentLoc - 1;                 // slow mode 1 step
-                  if (keymode) sc.TargetLoc -= 7;                   // fast mode -> 8steps
-                  sc.trigger = true;
-                  keystate=3;
-              }
-            }
-          }//else
-          break;
-    case 1: //-----------------------------------------=  check is key still pressed
-          if ( !MyTmr3 ) break ;                          // wait for timer
-          if ( digitalRead(ROTS) == LOW )
-          { keymode = ~keymode;                         // toggle keymode
-            keystate++;
-          }
-          else keystate=0;
-          break;
-    case 2: //-----------------------------------------=  Wait for key release
-          if ( digitalRead(ROTS) == HIGH )
-          { keystate = 0;
-          }
-          break;
-    case 3: //-----------------------------------------=  Wait for rotery signal lock
-          if ( digitalRead(ROTA) == HIGH ) keystate = 0;
-          break;
-    default: //-----------------------------------------=  
-          keystate = 0;
-          break;
-  }//switch
-}//Keypad_StateMachine
+  NoOfSteps=1000;
+  
+  pinMode(13,OUTPUT);
+  digitalWrite(sleepPin, LOW); //Easydriver Pwer off (Low = powered down)
+  digitalWrite(ms1Pin, HIGH);
+  digitalWrite(ms2Pin, HIGH);
+  digitalWrite(resetPin, HIGH);
+  digitalWrite(enablePin, LOW);
+  digitalWrite(pfdPin, HIGH);
+}
 
+void loop() {
+ 
+  int bCommandReady = false;
+  
+  //FocuserControl Power off command
+  if (millis() > (powerMillis + 20000)) // check if power has been on for more than 20 seconds
+  {
+      digitalWrite(sleepPin, LOW); // if yes, then disable power
+  }
+  
+  //If There is information in the Serial buffer read it in and start the Build command subroutine
+  if (usingSerial && Serial.available() >= 1) {
+    // read the incoming byte:
+    incomingByte = Serial.read();
+    delay(5);
+    if (incomingByte == '#') {
+      /* Build a new command. */
+      bCommandReady = cliBuildCommand(incomingByte);
+    }
+  }
+  else
+  {
+    incomingByte=0;
+    //Serial.flush();
+  }
 
-//-------------------------------------------------------------------------------------
-//- MyUtoA, Unsigned integer to Ascii string zero padded to 5 digits, d300 -> "00300"
-//-                                                                                   -
-//-------------------------------------------------------------------------------------
-void MyUtoA(unsigned int number)
-{
-    char tmp[10];
-
-    utoa(number,tmp ,10);                                // uInt to String ,base10
-    
-    switch ( strlen(tmp) ) {
-      case 0: //-----------------------------------------= empty string
-      { Str2Bytecat(&txframe[3],"00000");
-        break;
-      }
-      case 1: //-----------------------------------------= singles
-      { Str2Bytecat(&txframe[3],"0000");                   // FG000004
-        Str2Bytecat(&txframe[7], tmp );                    // maybe txframe[7]=tmp[0];
-        break;
-      }
-      case 2: //-----------------------------------------= Decimals
-      { Str2Bytecat(&txframe[3],"000");
-        Str2Bytecat(&txframe[6], tmp );
-        break;
-      }
-      case 3: //-----------------------------------------= Hundreds
-      { Str2Bytecat(&txframe[3],"00");
-        Str2Bytecat(&txframe[5], tmp );
-        break;
-      }
-      case 4: //-----------------------------------------= Thousends
-      { Str2Bytecat(&txframe[3],"0");                      // maybe txframe[3]='0';
-        Str2Bytecat(&txframe[4], tmp );
-        break;
-      }
-      case 5: //-----------------------------------------= TenThousends
-      { Str2Bytecat(&txframe[3], tmp );
-        break;
-      }
-      case 6: //-----------------------------------------= Hundredthousends
-      { Str2Bytecat(&txframe[3], &tmp[1] );                   // !!exception clip to TenThousends
-        break;
-      }
-      default:
-      { Str2Bytecat(&txframe[3],"00000");
-      }
-    }//switch
-    
-}//MyUtoA
-
-
+  //If there is a command in the buffer then run the process command subroutine
+  if (bCommandReady == true) {
+    bCommandReady = false; // reset the command ready flag
+    cliProcessCommand(); // run the command
+  }
+  if ((Position != configuration.parkposition)) {
+    configuration.parked = 0;
+    EEPROM_writeAnything(0, configuration);
+  }
+  if (UPDATE){
+    UPDATE=false;
+    SerialDATAFun();  // Used to send the current state of the focuser to the PC over serial comms
+  }
+}
