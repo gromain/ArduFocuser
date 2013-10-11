@@ -22,7 +22,7 @@ int enablePin = 6;
 int resetPin = 5;
 int pfdPin = 4;
 unsigned long powerMillis = 0; // used to remember when EasyDriver power was enabled
-int motorSteps =1600; //number if steps for the motor to turn 1 revolution
+int motorSteps = 200; //number if steps for the motor to turn 1 revolution
 
 
 volatile long NoOfSteps = 1000; //required number of steps to make
@@ -72,9 +72,9 @@ command_t;
 void EasyDriverStep(boolean dir,long steps){
   digitalWrite(sleepPin, HIGH); // enable power to the EasyDriver
   powerMillis = millis(); // remember when power was switched on
-  delayMicroseconds(10); // wait a bit after switching on power
+  delay(1); // wait a bit after switching on power
   digitalWrite(dirPin,dir);
-  delay(100);
+  delay(1);
   for(int i=0;i<steps;i++){
     digitalWrite(stepperPin, HIGH);
     delayMicroseconds(Speed);
@@ -98,7 +98,6 @@ void ParkFocuserFun (void) {//Park the focuser by setting the Park bit to 1 and 
 
 void FocusINFun (void) {//Move the Stepper IN.
   long Steps = 0;
-
   if (Absolute == false) {  //If not Absolute move the number of steps
     if ((Position-NoOfSteps)>=0) {
         EasyDriverStep(Direction,NoOfSteps);
@@ -382,15 +381,21 @@ void setup() {
   
   Serial.begin(19200);// start the serial
   
-  NoOfSteps=1000;
+  NoOfSteps=motorSteps;
   
   pinMode(13,OUTPUT);
   digitalWrite(sleepPin, LOW); //Easydriver Pwer off (Low = powered down)
-  digitalWrite(ms1Pin, HIGH);
-  digitalWrite(ms2Pin, HIGH);
-  digitalWrite(resetPin, HIGH);
-  digitalWrite(enablePin, LOW);
-  digitalWrite(pfdPin, HIGH);
+// MS1/MS2 Truth table
+// ms1  ms2  Resol
+//  L    L    Full steps
+//  H    L    Half steps
+//  L    H    Quarter steps
+//  H    H    Eight steps
+  digitalWrite(ms1Pin, LOW); // see above
+  digitalWrite(ms2Pin, LOW); // see above
+  digitalWrite(resetPin, HIGH); // Not reset
+  digitalWrite(enablePin, LOW); // System enabled
+  digitalWrite(pfdPin, HIGH); // Slow decay, if LOW Fast Decay
 }
 
 void loop() {
